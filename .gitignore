@@ -1,0 +1,20 @@
+# Snakemake internal files
+/.snakemake/
+
+# Sequencing data and analysis outputs
+/data/
+/results/
+/logs/
+
+# Python temporary files
+__pycache__/
+*.pyc
+
+# Local virtual environments
+.venv/
+venv/
+
+# IDE and editor files
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,24 @@
+# ==========================================
+# MGAP Variant Comparison Pipeline
+# Configuration
+# ==========================================
+
+# CNV filtering and matching
+cnv:
+  deletion_max_rd: 0.25
+  duplication_min_rd: 1.75
+  min_reciprocal_overlap: 0.50
+
+# Structural variation filtering
+sv:
+  min_score: 40
+
+# Resistance gene filtering
+resistance:
+  min_coverage: 90
+  min_depth: 30
+
+# Virulence gene filtering
+virulence:
+  min_coverage: 90
+  min_depth: 30

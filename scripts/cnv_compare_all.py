@@ -100,7 +100,7 @@ results = []
 for group in groups:
     present_in = sorted({call["Sample"] for call in group})
 
-    # Exclude CNVs reported in all four samples
+    # Exclude CNVs reported in all samples
     if len(present_in) == len(sample_names):
         continue
 

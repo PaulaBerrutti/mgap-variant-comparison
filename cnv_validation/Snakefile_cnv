@@ -1,0 +1,578 @@
+# ==========================================
+# Universal CNV Validation Pipeline
+# ==========================================
+
+from pathlib import Path
+import csv
+
+# ------------------------------------------
+# Discover reference genomes and accessions
+# ------------------------------------------
+
+REFERENCES = {}
+
+for fasta in sorted(Path("references").glob("*.fasta")):
+
+    accessions = set()
+
+    with fasta.open() as f:
+        for line in f:
+            if line.startswith(">"):
+                accessions.add(line[1:].split()[0])
+
+    REFERENCES[str(fasta)] = accessions
+
+
+# ------------------------------------------
+# Discover species and samples
+# ------------------------------------------
+
+SPECIES = {}
+
+for csv_path in sorted(
+    Path("results").glob("*/cnv_comparison_all.csv")
+):
+
+    species = csv_path.parent.name
+
+    with csv_path.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    chromosomes = {
+        row["Chromosome"].strip()
+        for row in rows
+    }
+
+    matches = [
+        fasta
+        for fasta, accessions in REFERENCES.items()
+        if chromosomes and chromosomes.issubset(accessions)
+    ]
+
+    if len(matches) != 1:
+        raise ValueError(
+            f"{species}: expected one matching reference, "
+            f"found {len(matches)}"
+        )
+
+    sample_dir = Path("data") / species
+
+    if not sample_dir.is_dir():
+        raise ValueError(
+            f"{species}: sample directory missing"
+        )
+
+    samples = sorted(
+        folder.name
+        for folder in sample_dir.iterdir()
+        if folder.is_dir()
+    )
+
+    if not samples:
+        raise ValueError(
+            f"{species}: no samples found"
+        )
+
+    SPECIES[species] = {
+        "reference": matches[0],
+        "samples": samples
+    }
+
+    print(
+        f"DISCOVERED: {species} | "
+        f"{len(samples)} samples | "
+        f"{matches[0]}"
+    )
+
+
+# ------------------------------------------
+# Workflow targets — first testing stage
+# ------------------------------------------
+
+rule all:
+    input:
+        # CNV candidate manifests
+        expand(
+            "cnv_validation/results/{species}/cnv_candidates.csv",
+            species=sorted(SPECIES)
+        ),
+
+        # Reference indexes
+        [
+            f"{info['reference']}.{suffix}"
+            for info in SPECIES.values()
+            for suffix in ("amb", "ann", "bwt", "pac", "sa", "fai")
+        ],
+
+        # Sorted BAM indexes for all samples
+        [
+            f"data/{species}/{sample}/{sample}.sorted.bam.bai"
+            for species, info in SPECIES.items()
+            for sample in info["samples"]
+        ],
+
+        # CNV coverage for all samples
+        [
+            f"cnv_validation/results/{species}/coverage/{sample}.csv"
+            for species, info in SPECIES.items()
+            for sample in info["samples"]
+        ],
+
+        # Reference-repeat evidence for every species
+        [
+            f"cnv_validation/results/{species}/cnv_repeat_evidence.csv"
+            for species in sorted(SPECIES)
+        ],
+
+        # Sample processing status for all species
+        [
+            f"cnv_validation/results/{species}/sample_input_status.csv"
+            for species in sorted(SPECIES)
+        ],
+
+        # Final CNV validation reports
+        [
+            f"cnv_validation/results/{species}/cnv_validation_report_multi.md"
+            for species in sorted(SPECIES)
+        ]
+
+# ------------------------------------------
+# Prepare CNV candidate manifest
+# ------------------------------------------
+
+rule prepare_cnv_candidates:
+    input:
+        csv="results/{species}/cnv_comparison_all.csv",
+        script="cnv_validation/scripts/prepare_cnv_candidates_multi.py"
+    output:
+        "cnv_validation/results/{species}/cnv_candidates.csv"
+    params:
+        samples=lambda wc: " ".join(
+            SPECIES[wc.species]["samples"]
+        )
+    shell:
+        """
+        python {input.script:q} \
+            {input.csv:q} \
+            {output:q} \
+            {params.samples}
+        """
+
+# ==========================================
+# Index reference genomes for BWA-MEM
+# ==========================================
+
+rule bwa_index:
+    input:
+        "references/{refname}.fasta"
+    output:
+        "references/{refname}.fasta.amb",
+        "references/{refname}.fasta.ann",
+        "references/{refname}.fasta.bwt",
+        "references/{refname}.fasta.pac",
+        "references/{refname}.fasta.sa"
+    shell:
+        "bwa index {input:q}"
+
+
+# ==========================================
+# Index reference genomes for samtools
+# ==========================================
+
+rule samtools_faidx:
+    input:
+        "references/{refname}.fasta"
+    output:
+        "references/{refname}.fasta.fai"
+    shell:
+        "samtools faidx {input:q}"
+
+# ==========================================
+# Map paired FASTQs and create sorted BAM
+# ==========================================
+
+rule map_reads:
+    input:
+        reference=lambda wc: SPECIES[wc.species]["reference"],
+        bwa_index=lambda wc: [
+            SPECIES[wc.species]["reference"] + "." + ext
+            for ext in ("amb", "ann", "bwt", "pac", "sa")
+        ],
+        r1="data/{species}/{sample}/{sample}_R1.fq.gz",
+        r2="data/{species}/{sample}/{sample}_R2.fq.gz"
+
+    output:
+        bam="data/{species}/{sample}/{sample}.sorted.bam"
+
+    log:
+        bwa="cnv_validation/logs/{species}/{sample}/bwa_mapping.log",
+        sort="cnv_validation/logs/{species}/{sample}/samtools_sort.log",
+        qc="cnv_validation/logs/{species}/{sample}/samtools_quickcheck.log"
+
+    threads: 4
+
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p cnv_validation/logs/{wildcards.species}/{wildcards.sample}
+
+        echo "[START] Mapping and sorting: {wildcards.sample}"
+
+        echo "===== $(date -Is) | bwa mem =====" >> {log.bwa:q}
+        echo "Reference: {input.reference}" >> {log.bwa:q}
+        echo "R1: {input.r1}" >> {log.bwa:q}
+        echo "R2: {input.r2}" >> {log.bwa:q}
+
+        echo "===== $(date -Is) | samtools sort =====" >> {log.sort:q}
+
+        if bwa mem -t 3 \
+            {input.reference:q} \
+            {input.r1:q} \
+            {input.r2:q} \
+            2>> {log.bwa:q} |
+            samtools sort -@ 1 -m 1G \
+            -o {output.bam:q} - \
+            2>> {log.sort:q}
+        then
+            echo "[DONE] Mapping and sorting: {wildcards.sample}"
+        else
+            echo "[ERROR] Mapping or sorting failed: {wildcards.sample}"
+            exit 1
+        fi
+
+        echo "[START] Checking BAM: {wildcards.sample}"
+
+        echo "===== $(date -Is) | samtools quickcheck =====" >> {log.qc:q}
+
+        if samtools quickcheck -v {output.bam:q} >> {log.qc:q} 2>&1
+        then
+            echo "PASS: BAM quickcheck" >> {log.qc:q}
+            echo "[DONE] BAM check: {wildcards.sample}"
+        else
+            echo "[ERROR] BAM check failed: {wildcards.sample}"
+            exit 1
+        fi
+        """
+
+# ==========================================
+# Index sorted BAM with detailed logging
+# ==========================================
+
+rule bam_index:
+    input:
+        bam="data/{species}/{sample}/{sample}.sorted.bam"
+
+    output:
+        bai="data/{species}/{sample}/{sample}.sorted.bam.bai"
+
+    log:
+        "cnv_validation/logs/{species}/{sample}/samtools_index.log"
+
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p cnv_validation/logs/{wildcards.species}/{wildcards.sample}
+
+        echo "[START] BAM indexing: {wildcards.sample}"
+
+        echo "========================================" >> {log:q}
+        echo "Started: $(date -Is)" >> {log:q}
+        echo "Sample: {wildcards.sample}" >> {log:q}
+        echo "Input: {input.bam}" >> {log:q}
+        echo "Output: {output.bai}" >> {log:q}
+        samtools --version | sed -n '1p' >> {log:q}
+        echo "Command: samtools index {input.bam} {output.bai}" >> {log:q}
+
+        if samtools index \
+            {input.bam:q} \
+            {output.bai:q} >> {log:q} 2>&1
+        then
+            echo "Exit status: 0" >> {log:q}
+            echo "Finished: $(date -Is)" >> {log:q}
+            echo "[DONE] BAM indexing: {wildcards.sample}"
+        else
+            status=$?
+            echo "Exit status: $status" >> {log:q}
+            echo "Failed: $(date -Is)" >> {log:q}
+            echo "[ERROR] BAM indexing: {wildcards.sample}"
+            exit "$status"
+        fi
+        """
+
+# ==========================================
+# Measure CNV coverage for each sample
+# ==========================================
+
+rule measure_cnv_coverage:
+    input:
+        bam="data/{species}/{sample}/{sample}.sorted.bam",
+        bai="data/{species}/{sample}/{sample}.sorted.bam.bai",
+        manifest="cnv_validation/results/{species}/cnv_candidates.csv",
+        script="cnv_validation/scripts/measure_cnv_coverage.py"
+
+    output:
+        "cnv_validation/results/{species}/coverage/{sample}.csv"
+
+    log:
+        "cnv_validation/logs/{species}/{sample}/cnv_coverage.log"
+
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p cnv_validation/logs/{wildcards.species}/{wildcards.sample}
+
+        echo "[START] CNV coverage: {wildcards.sample}"
+
+        echo "========================================" >> {log:q}
+        echo "Started: $(date -Is)" >> {log:q}
+        echo "Sample: {wildcards.sample}" >> {log:q}
+        echo "Input BAM: {input.bam}" >> {log:q}
+        echo "CNV manifest: {input.manifest}" >> {log:q}
+        python --version >> {log:q} 2>&1
+
+        echo "Command: python {input.script} {wildcards.sample} {input.bam} {input.manifest} {output}" >> {log:q}
+
+        if python {input.script:q} \
+            {wildcards.sample:q} \
+            {input.bam:q} \
+            {input.manifest:q} \
+            {output:q} >> {log:q} 2>&1
+        then
+            echo "Exit status: 0" >> {log:q}
+            echo "Finished: $(date -Is)" >> {log:q}
+            echo "[DONE] CNV coverage: {wildcards.sample}"
+        else
+            status=$?
+            echo "Exit status: $status" >> {log:q}
+            echo "Failed: $(date -Is)" >> {log:q}
+            echo "[ERROR] CNV coverage: {wildcards.sample}"
+            exit "$status"
+        fi
+        """
+
+# ==========================================
+# Analyze CNV reference repeats
+# ==========================================
+
+rule analyze_cnv_repeats:
+    input:
+        reference=lambda wc: SPECIES[wc.species]["reference"],
+        fai=lambda wc: SPECIES[wc.species]["reference"] + ".fai",
+        bwa_index=lambda wc: [
+            SPECIES[wc.species]["reference"] + "." + ext
+            for ext in ("amb", "ann", "bwt", "pac", "sa")
+        ],
+        manifest="cnv_validation/results/{species}/cnv_candidates.csv",
+        script="cnv_validation/scripts/analyze_cnv_repeats.py"
+
+    output:
+        "cnv_validation/results/{species}/cnv_repeat_evidence.csv"
+
+    log:
+        "cnv_validation/logs/{species}/cnv_repeat_analysis.log"
+
+    threads: 1
+
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p cnv_validation/logs/{wildcards.species}
+
+        echo "[START] CNV repeat analysis: {wildcards.species}"
+
+        echo "========================================" >> {log:q}
+        echo "Started: $(date -Is)" >> {log:q}
+        echo "Species: {wildcards.species}" >> {log:q}
+        echo "Reference: {input.reference}" >> {log:q}
+        echo "Manifest: {input.manifest}" >> {log:q}
+        echo "Output: {output}" >> {log:q}
+
+        python --version >> {log:q} 2>&1
+        samtools --version | sed -n '1p' >> {log:q}
+        bwa 2>&1 | grep -m 1 'Version:' >> {log:q} || true
+
+        echo "Running: python {input.script} {input.reference} {input.manifest} {output}" >> {log:q}
+
+        if python {input.script:q} \
+            {input.reference:q} \
+            {input.manifest:q} \
+            {output:q} >> {log:q} 2>&1
+        then
+            echo "Exit status: 0" >> {log:q}
+            echo "Finished: $(date -Is)" >> {log:q}
+            echo "[DONE] CNV repeat analysis: {wildcards.species}"
+        else
+            status=$?
+            echo "Exit status: $status" >> {log:q}
+            echo "Failed: $(date -Is)" >> {log:q}
+            echo "[ERROR] CNV repeat analysis: {wildcards.species}"
+            exit "$status"
+        fi
+        """
+
+# ==========================================
+# Record sample processing status
+# ==========================================
+
+rule record_sample_status:
+    input:
+        manifest="cnv_validation/results/{species}/cnv_candidates.csv",
+        coverage=lambda wc: [
+            f"cnv_validation/results/{wc.species}/coverage/{sample}.csv"
+            for sample in SPECIES[wc.species]["samples"]
+        ],
+        bam=lambda wc: [
+            f"data/{wc.species}/{sample}/{sample}.sorted.bam"
+            for sample in SPECIES[wc.species]["samples"]
+        ],
+        bai=lambda wc: [
+            f"data/{wc.species}/{sample}/{sample}.sorted.bam.bai"
+            for sample in SPECIES[wc.species]["samples"]
+        ]
+
+    output:
+        "cnv_validation/results/{species}/sample_input_status.csv"
+
+    log:
+        "cnv_validation/logs/{species}/sample_input_status.log"
+
+    run:
+        from datetime import datetime
+        import sys
+
+        print(f"[START] Sample status: {wildcards.species}")
+
+        samples = SPECIES[wildcards.species]["samples"]
+
+        output_path = Path(output[0])
+        log_path = Path(log[0])
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with log_path.open("a") as logfile:
+            logfile.write(
+                f"\nStarted: {datetime.now().astimezone().isoformat()}\n"
+            )
+            logfile.write(f"Species: {wildcards.species}\n")
+            logfile.write(f"Python: {sys.version}\n")
+
+            rows = []
+
+            for sample in samples:
+                bam = Path(
+                    f"data/{wildcards.species}/{sample}/{sample}.sorted.bam"
+                )
+                bai = Path(str(bam) + ".bai")
+                coverage = Path(
+                    f"cnv_validation/results/{wildcards.species}/"
+                    f"coverage/{sample}.csv"
+                )
+
+                if not all(
+                    path.is_file() and path.stat().st_size > 0
+                    for path in (bam, bai, coverage)
+                ):
+                    logfile.write(f"ERROR: Missing input for {sample}\n")
+                    raise ValueError(f"Missing required input: {sample}")
+
+                rows.append({
+                    "Sample": sample,
+                    "Input_status": "READY",
+                    "Input_details": (
+                        "Sorted BAM, index and coverage available"
+                    )
+                })
+
+                logfile.write(f"READY: {sample}\n")
+
+            with output_path.open("w", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "Sample",
+                        "Input_status",
+                        "Input_details"
+                    ]
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+
+            logfile.write(f"Total READY: {len(rows)}\n")
+            logfile.write(
+                f"Finished: {datetime.now().astimezone().isoformat()}\n"
+            )
+            logfile.write("Exit status: 0\n")
+
+        print(f"[DONE] Sample status: {wildcards.species}")
+
+# ==========================================
+# Build the final CNV validation report
+# ==========================================
+
+rule build_cnv_report:
+    input:
+        manifest="cnv_validation/results/{species}/cnv_candidates.csv",
+        coverage=lambda wc: [
+            f"cnv_validation/results/{wc.species}/coverage/{sample}.csv"
+            for sample in SPECIES[wc.species]["samples"]
+        ],
+        repeats="cnv_validation/results/{species}/cnv_repeat_evidence.csv",
+        status="cnv_validation/results/{species}/sample_input_status.csv",
+        script="cnv_validation/scripts/build_cnv_report_multi.py"
+
+    output:
+        "cnv_validation/results/{species}/cnv_validation_report_multi.md"
+
+    params:
+        coverage_dir=lambda wc: (
+            f"cnv_validation/results/{wc.species}/coverage"
+        )
+
+    log:
+        "cnv_validation/logs/{species}/cnv_report.log"
+
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p cnv_validation/logs/{wildcards.species}
+
+        echo "[START] CNV report: {wildcards.species}"
+
+        echo "========================================" >> {log:q}
+        echo "Started: $(date -Is)" >> {log:q}
+        echo "Species: {wildcards.species}" >> {log:q}
+        echo "Manifest: {input.manifest}" >> {log:q}
+        echo "Coverage directory: {params.coverage_dir}" >> {log:q}
+        echo "Repeat evidence: {input.repeats}" >> {log:q}
+        echo "Sample status: {input.status}" >> {log:q}
+        echo "Output: {output}" >> {log:q}
+
+        python --version >> {log:q} 2>&1
+
+        echo "Command: python {input.script} {input.manifest} {params.coverage_dir} {input.repeats} {input.status} {output}" >> {log:q}
+
+        if python {input.script:q} \
+            {input.manifest:q} \
+            {params.coverage_dir:q} \
+            {input.repeats:q} \
+            {input.status:q} \
+            {output:q} >> {log:q} 2>&1
+        then
+            echo "Exit status: 0" >> {log:q}
+            echo "Finished: $(date -Is)" >> {log:q}
+            echo "[DONE] CNV report: {wildcards.species}"
+        else
+            status=$?
+            echo "Exit status: $status" >> {log:q}
+            echo "Failed: $(date -Is)" >> {log:q}
+            echo "[ERROR] CNV report: {wildcards.species}"
+            echo "See diagnostic log: {log}"
+            exit "$status"
+        fi
+        """

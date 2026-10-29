@@ -50,14 +50,61 @@ For each species, Snakemake defines the following reports:
 - `vir_comparison.xlsx`
 Outputs are written to `results/<species>/`.
 
-## Current status and limitations
-The repository is under active development.
-The current workflow compares MGAP-generated results.
-Variant representation, filtering assumptions, and the distinction between an absent variant call and a confirmed reference genotype require further evaluation.
-Software dependencies, execution instructions and reproducibility testing will be documented as the project is prepared for wider use.
+
+## CNV validation workflow
+
+In addition to comparing MGAP output tables, this repository includes an independent CNV read-depth validation workflow using Snakemake, BWA-MEM, samtools and Python.
+
+The workflow is defined in `cnv_validation/Snakefile_cnv` and uses the scripts in `cnv_validation/scripts/`.
+
+### CNV validation steps
+
+1. Discover species, samples and MGAP CNV candidate tables.
+2. Match each species to a reference FASTA using the sequence accessions in the CNV candidates.
+3. Index the reference with BWA and samtools.
+4. Map locally available paired-end FASTQ reads with BWA-MEM and sort and index the resulting BAM files with samtools.
+5. Measure CNV-region coverage and compare it with upstream and downstream flanking regions at different mapping-quality thresholds.
+6. Align candidate reference sequences back to the reference genome to investigate repetitive or ambiguous regions.
+7. Record sample-processing status and generate a species-specific CNV validation report.
+
+### Directory structure
+
+- `cnv_validation/Snakefile_cnv` — CNV validation workflow.
+- `cnv_validation/scripts/` — CNV preparation, coverage, repeat-analysis and reporting scripts.
+- `references/` — Local reference FASTA files and indexes (not distributed).
+- `data/<species>/<sample>/` — Local sample inputs and generated BAM files (not distributed).
+- `cnv_validation/results/<species>/` — Generated CNV evidence and reports (not distributed).
+- `cnv_validation/logs/` — Diagnostic logs (not distributed).
+
+FASTQ files are named `<sample>_R1.fq.gz` and `<sample>_R2.fq.gz`. They must be placed in their sample directories before execution. The workflow does not copy data from external drives.
+
+### Running CNV validation
+
+From the repository root, with Snakemake, Python, BWA and samtools installed:
+
+```bash
+snakemake -s cnv_validation/Snakefile_cnv --cores 4
+```
+
+Snakemake can reuse completed, up-to-date outputs, including existing BAM files and indexes. The workflow produces per-sample coverage CSVs, per-species repeat-evidence CSVs, processing-status tables and Markdown validation reports.
+
+### Validation performed
+
+The workflow has been executed on four bacterial species, with four isolates per species (16 samples in total). It generated read-depth evidence for 15 CNV candidates across 60 sample–candidate combinations and produced four species-specific reports.
+
+These results are not included in the public repository.
+
+### Current limitations
+
+- CNV conclusions remain conservative and require additional evidence, including breakpoint or structural-variant support.
+- Repetitive reference regions and differences between sample genomes and reference genomes can complicate read-depth interpretation.
+- The current workflow requires the expected sample inputs; graceful skipping of missing FASTQ/BAM inputs is not yet fully implemented.
+- Diagnostic logging has been added to the principal analysis stages, but logging completeness and software-environment reproducibility need further refinement.
+- Reference selection by sequence accession does not by itself establish that the reference is an ideal biological match to each isolate.
 
 ## Planned development
-A subsequent phase will extend the Snakemake workflow with alignment-processing and inspection steps using tools such as BWA and SAMtools to support manual validation of candidate variants.
+
+Future work includes more extensive BAM quality-control checks, breakpoint-support analysis, stronger workflow logging, graceful handling of missing inputs, and reproducible software-environment specifications. SNP, indel and SV validation may also be extended beyond MGAP table comparisons.
 
 ## Data availability
 Clinical and workplace sequencing data are not distributed with this repository.

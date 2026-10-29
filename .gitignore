@@ -1,5 +1,5 @@
-# Snakemake internal files
-/.snakemake/
+# Snakemake internal files at any directory level
+.snakemake/
 
 # Sequencing data and analysis outputs
 /data/
@@ -18,3 +18,21 @@ venv/
 .idea/
 *.swp
 *.swo
+
+/cnv_validation/fastq/
+/cnv_validation/results/
+/cnv_validation/references/
+
+# Shared sequencing inputs and mapped reads
+/fastq/
+/bam/
+/references/
+
+# Structural variant validation outputs
+/sv_validation/results/
+
+# CNV validation diagnostic logs
+/cnv_validation/logs/
+
+# Local CNV validation backups
+/cnv_validation_backups/
